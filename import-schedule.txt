@@ -1,0 +1,485 @@
+Sub Import_Sched()
+
+	' Module 1 in SCHEDULE PREVIEWER.xlsm is designed to parse the automated schedule report from eIVF and
+	' make a note of all appointments. All visit-preview flags will be set to their default states (eg,
+	' patients listed as having no insurance will have the SELF-PAY flag set).
+		' NEW patients will be added to the "Master" tab
+		' NEW appointments will be added to the Excel sheet "Schedule"
+		' CANCELED appointments will be noted as such
+		' MODIFIED appointments will be adjusted as needed (new provider, new insurance, etc)
+		' OLD appointments (older than today) are to be pruned with a different algorithm
+		' The documents-to-be-printed will be set to default values
+	' The algorithm will make a note of new insurance carriers and add them to the internal database
+	' Finally, the Master tab will be sorted
+
+    Dim wsmaster As Worksheet
+    Dim wsschedule As Worksheet
+    Dim wsreport As Worksheet
+    Dim wsimport As Worksheet
+    
+    Set wsmaster = Sheet1
+    Set wsschedule = Sheet2
+    Set wsreport = Sheet7
+    Set wsimport = Sheet8
+    
+    ' Turn off unnecessary matching algorithms on Excel tabs before importing
+    
+    Sheet9.Range("H1") = False ' Sorter tab
+    Sheet12.Range("C2").ClearContents ' By_Patient tab
+    Sheet10.Range("C2").ClearContents ' Daily tab
+    Sheet10.Range("E2").ClearContents
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    ' Set the start time
+    
+    wsimport.Range("L2") = Time
+    
+    ' Before importing, clear variables from any previous import
+    
+    wsimport.Range("B3").ClearContents
+    wsimport.Range("B5").ClearContents
+    wsimport.Range("B7").ClearContents
+    wsimport.Range("F3:F5").ClearContents
+    wsimport.Range("F26").ClearContents
+    wsimport.Range("F30").ClearContents
+    wsimport.Range("F32").ClearContents
+    
+    wsimport.Calculate
+    
+    ' Put the date range of the reports onto the Import tab
+    id1 = Mid(wsreport.Range("C2"), 2, Len(wsreport.Range("C2")) - 2)
+    id2 = Mid(wsreport.Range("C3"), 2, Len(wsreport.Range("C3")) - 2)
+    wsimport.Range("B18") = id1 & " to " & id2
+    
+    Call Find_Columns   ' This routine searches the report and identifies the columns where certain data lives.
+    
+    ' Store the discovered columns from the Import tab.
+    
+    Dim Colnums(1 To 12) As Integer
+    For i = 1 To 12
+        Colnums(i) = wsimport.Cells(20 + i, 2)
+        If Colnums(i) = 0 Then
+            MsgBox ("Column for " & wsimport.Cells(20 + i, 1) & " not found. Please verify the correct Schedule Analysis report has been loaded and is lined up on Cell A1.")
+            Exit Sub
+        End If
+        Next i
+        
+    ptid_col = wsimport.Range("B21")
+    ptname_col = wsimport.Range("B22")
+    dos_col = wsimport.Range("B23")
+    time_col = wsimport.Range("B24")
+    prim_col = wsimport.Range("B25")
+    primid_col = wsimport.Range("B26")
+    sec_col = wsimport.Range("B27")
+    secid_col = wsimport.Range("B28")
+    loc_col = wsimport.Range("B29")
+    prov_col = wsimport.Range("B30")
+    vis_col = wsimport.Range("B31")
+    status_col = wsimport.Range("B32")
+    
+    wsimport.Range("L5") = True
+    wsimport.Calculate
+    MASTER_EOL = wsimport.Range("B2")
+    SCHEDULE_EOL = wsimport.Range("F2")
+    
+    masterEOL = wsimport.Range("B2") ' This is the row number we will use for new patients
+    masterSel = wsimport.Range("B4") ' This is the row number we will use for a selected patient
+    prevID = 0 ' The line of the patient we last modified
+    neededWS = "none"
+    
+    If MASTER_EOL = "error" Or SCHEDULE_EOL = "error" Then ' For some reason, the EOL has been removed. Add another and set the variable again
+    
+        Call Add_EOL
+        wsimport.Calculate
+        MASTER_EOL = wsimport.Range("B2")
+        SCHEDULE_EOL = wsimport.Range("F2")
+        wsimport.Range("L5") = False
+        
+        ' From this point on, we don't need to rely on the EOL found in Import, or use the Add_EOL routine.
+    
+    End If
+    
+    
+    
+    wsimport.Range("L5") = False
+    reportLine = 12 ' The eIVF reports usually begin on line 12
+    reportVal = wsreport.Cells(reportLine, dos_col) ' dos_col is the column containing the scheduled date; it is NEVER blank
+    defaultDate = 38353 ' This is the Excel equivalent of the date January 1, 2005.
+    
+    While Not reportVal = "" ' Proceed through the schedule until we get to a blank date
+        
+        secs = Timer()
+        
+        ' Add the identifying data to the Import tab for cross-referencing
+        
+        wsimport.Range("B3") = wsreport.Cells(reportLine, ptid_col) ' Patient ID
+        wsimport.Range("F3") = wsreport.Cells(reportLine, ptid_col) ' Patient ID
+        wsimport.Range("F4") = wsreport.Cells(reportLine, dos_col) ' The RAW version of the date, could be in string form
+        wsimport.Range("F5") = wsreport.Cells(reportLine, time_col) ' Time
+        
+        schedIns = wsreport.Cells(reportLine, prim_col)
+        schedIns2 = wsreport.Cells(reportLine, sec_col)
+        wsimport.Range("F26") = schedIns
+        wsimport.Range("G26") = schedIns2
+        
+        ' Insert location and status to the Import tab
+        appLoc = wsreport.Cells(reportLine, loc_col)
+        appStat = wsreport.Cells(reportLine, status_col)
+        
+        wsimport.Range("F30") = appLoc
+        wsimport.Range("F32") = appStat
+        
+       ' Here we CALCULATE the Import tab manually, rather than allow all calculations in the spreadsheet to run.
+       ' This is how we increase performance.
+       
+        wsimport.Calculate ' Calculate the Import tab once so we can reset pointers
+
+        masterSel = wsimport.Range("B4") ' After placing patient data in the cells, re-set
+        schedIns = wsimport.Range("F27") ' Take the matched insurance value; this should ALWAYS be in the system, since we would have
+        schedIns2 = wsimport.Range("G27") ' added it in the routine above; use the crosswalked name for the insurance
+        acctbal = wsimport.Range("B16") ' Grab the account balance
+        
+        ' Verify location and status are known and valid
+        
+        If wsimport.Range("F31") = False Then ' If we do not recognize this location, add it
+        
+            Call Add_Loc(appLoc)
+            
+        Else
+        
+            ' If we do recognize this location, use the LIST AS column to describe it.
+            
+            appLoc = wsimport.Range("G30")
+        
+        End If
+        
+        If wsimport.Range("F33") = False Then ' If we do not recognize this status, add it
+        
+            Call Add_Stat(appStat)
+        
+        End If
+        
+        ' Check to see whether the current patient is on our list, and set a variable to the proper line
+        
+        If wsimport.Range("B4") = "none" Then ' There is NO match, so we add a new patient
+        
+            masterline = MASTER_EOL
+            needEOL = True
+            neededWS = "master"
+            
+        Else ' There IS a match, so we update the information
+        
+            masterline = masterSel
+            needEOL = False
+            neededWS = "none"
+        
+        End If
+        
+        ' Execute the updating of the line, provided we haven't seen this ID already during this session
+        
+        thisID = wsreport.Cells(reportLine, ptid_col)
+        
+        If Not prevID = thisID And Not wsreport.Cells(reportLine, ptname_col) = "BLOCK SCHEDULE" Then
+        
+            secs3 = Timer()
+            
+            prevID = thisID ' Remember the last patient we modified. The Schedule Analysis report is sorted by
+                                        ' patient ID, so if we only have to update each patient the first time we see that ID.
+                                        ' If we've already seen it, it's already done.
+                    
+            ' The following can be scraped from the report.
+            
+            patientID = wsreport.Cells(reportLine, ptid_col)
+            patientName = wsreport.Cells(reportLine, ptname_col)
+            primIns = wsreport.Cells(reportLine, prim_col)
+            primInsID = wsreport.Cells(reportLine, primid_col)
+            secIns = wsreport.Cells(reportLine, sec_col)
+            secInsID = wsreport.Cells(reportLine, secid_col)
+            vistype = wsreport.Cells(reportLine, 6) ' Column F should be the Visit Type
+            
+            
+            ' We plug in the primary and secondary insurance into the Import tab to get a correspondence.
+            ' This is because sometimes the report has two listings that both point toward the same insurance, or
+            ' when the listing in the report doesn't point where we want. Both "Self-Pay" and "Self Pay" should point
+            ' to the same internal listing, for instance.
+            
+            wsimport.Range("B5") = primIns
+            wsimport.Range("B7") = secIns
+            wsimport.Range("B11") = vistype
+
+            wsimport.Calculate
+            visok = wsimport.Range("B12")
+            
+            ' We check to see if the insurance we found is on our table.
+            
+            isnewins = False
+            
+            If wsimport.Range("B6") = "New Ins" Then ' We have to add the primary ins to the list
+            
+                Call Add_Ins(primIns)
+                isnewins = True
+            
+            End If
+            
+            If wsimport.Range("B8") = "New Ins" Then ' We have to add the secondary ins to the list
+            
+                Call Add_Ins(secIns)
+                isnewins = True
+            
+            End If
+            
+            If isnewins = True Then
+            
+                wsimport.Calculate
+            
+            End If
+            
+            ' Now that we can be sure the ins is on the list, reassign the correspondence to the variable
+            
+            primIns = wsimport.Range("B6")
+            schedIns = primIns
+            secIns = wsimport.Range("B8")
+            schedIns2 = secIns
+            
+            enroll_flag = Enroll_Decider(primIns, primInsID) ' Check to see if this is an insurance requiring enrollment
+            
+            ' We assign the new values to the Master list
+            
+            wsmaster.Cells(masterline, 1) = patientID
+            wsmaster.Cells(masterline, 2) = patientName
+            wsmaster.Cells(masterline, 3) = primIns
+            wsmaster.Cells(masterline, 4) = primInsID
+            wsmaster.Cells(masterline, 7) = secIns
+            wsmaster.Cells(masterline, 8) = secInsID
+            wsmaster.Cells(masterline, 31) = acctbal ' The balance on the patient's account
+            
+            If masterline = MASTER_EOL Then ' When we are entering a new patient, enter default values for the rest
+            
+                wsmaster.Cells(masterline, 20) = False ' Bad address defaults to "no, not yet."
+                wsmaster.Cells(masterline, 24) = False ' Talk to billing defaults to "no"
+                wsmaster.Cells(masterline, 27) = False ' Talk to lab defaults to "no"
+                
+                If enroll_flag = True Then ' The default value for Flag1 when it's an enroll-TRUE insurance
+                
+                    wsmaster.Cells(masterline, 22) = "PATIENT MUST ENROLL FOR FERTILITY BENEFITS"
+                
+                End If
+                
+                ' Other values can default to blank spaces.
+                
+            Else ' This is an existing patient, and we update the enroll flag, if we can.
+            
+                If enroll_flag = True Then ' This is an insurance that requires enrollment; if it doesn't, we don't bother
+            
+                    flags = Array(wsmaster.Cells(masterline, 22), wsmaster.Cells(masterline, 23), wsmaster.Cells(masterline, 25), wsmaster.Cells(masterline, 26))
+                    
+                    found_enroll_flag = False
+                    found_empty_flag = -1
+                    
+                    ' See if a flag already exists for this insurance
+                    
+                    For i = LBound(flags) To UBound(flags)
+                    
+                        If flags(i) = "THIS PATIENT HAS ENROLLED" Or flags(i) = "PATIENT MUST ENROLL FOR FERTILITY BENEFITS" Or flags(i) = "PATIENT DOESN'T NEED TO ENROLL" Then
+                        
+                            found_enroll_flag = True
+                            
+                        ElseIf flags(i) = "" And found_empty_flag = -1 Then
+                        
+                            found_empty_flag = i + 22
+                            
+                            If found_empty_flag > 23 Then found_empty_flag = found_empty_flag + 1
+                        
+                        End If
+                        
+                    Next i
+                        
+                    If found_enroll_flag = False And found_empty_flag > -1 Then
+                    
+                        wsmaster.Cells(masterline, found_empty_flag) = "PATIENT MUST ENROLL FOR FERTILITY BENEFITS" ' Set to default
+                    
+                    End If
+            
+                End If
+            
+            End If
+            
+            If needEOL = True Then ' Testing replacement code that should be more efficient
+
+                wsmaster.Cells(masterline + 1, 1) = "EOL"
+                MASTER_EOL = MASTER_EOL + 1
+                
+            End If
+            
+        End If
+        
+        ' PARSING THE SCHEDULE
+        ' Check to see if the current appointment is on our list, and either add or update as needed
+        
+        schedSel = wsimport.Range("F6") ' This is the row number we will use for a selected appointment
+        
+        If wsimport.Range("F6") = "none" And Not wsreport.Cells(reportLine, ptname_col) = "BLOCK SCHEDULE" And wsimport.Range("F29") = True Then
+            ' There is NO match, the patient isn't BLOCK SCHEDULE, and the date is current or future; we add an appointment
+        
+            If visok = True Then ' If this is an appointment we care about:
+        
+                schedLine = SCHEDULE_EOL
+                needEOL = True
+                neededWS = "schedule"
+            
+                ' Write in the appointment information. For a new appointment we write in everything.
+                
+                wsschedule.Cells(schedLine, 2) = wsreport.Cells(reportLine, ptid_col) ' ID
+                wsschedule.Cells(schedLine, 3) = wsreport.Cells(reportLine, ptname_col) ' Name
+                wsschedule.Cells(schedLine, 4) = wsimport.Range("G4") ' DOS is extracted as a VALUE from the Import tab, not as text
+                wsschedule.Cells(schedLine, 5) = appLoc ' wsreport.Cells(reportLine, loc_col) ' Location
+                wsschedule.Cells(schedLine, 6) = wsreport.Cells(reportLine, prov_col) ' Provider
+                wsschedule.Cells(schedLine, 7) = wsreport.Cells(reportLine, vis_col) ' Visit type
+                wsschedule.Cells(schedLine, 8) = wsreport.Cells(reportLine, status_col) ' Status
+                wsschedule.Cells(schedLine, 9) = CDate(wsreport.Cells(reportLine, time_col)) ' Time in
+                wsschedule.Cells(schedLine, 10) = schedIns ' The reassigned insurance value
+                wsschedule.Cells(schedLine, 11) = wsreport.Cells(reportLine, primid_col) ' Ins ID
+                wsschedule.Cells(schedLine, 18) = schedIns2 ' The reassigned secondary insurance value
+                wsschedule.Cells(schedLine, 19) = wsreport.Cells(reportLine, secid_col) ' Ins2 ID
+                wsschedule.Cells(schedLine, 12) = False ' PPCYC?
+                
+                getcopay = True
+                
+                If schedIns = "Progyny" Or schedIns = " SELF-PAY" Or schedIns = "Gestational Carrier" Or schedIns = "Donor — Do not bill" Then
+                
+                    getcopay = False
+                    
+                End If
+                
+                wsschedule.Cells(schedLine, 13) = getcopay ' OK to collect co-pay?
+                
+                ' All overrides for all clinic documents and by-ins documents defaults to FALSE
+                
+                wsschedule.Cells(schedLine, 20) = False
+                wsschedule.Cells(schedLine, 21) = False
+                wsschedule.Cells(schedLine, 22) = False
+                wsschedule.Cells(schedLine, 23) = False
+                wsschedule.Cells(schedLine, 24) = False
+                wsschedule.Cells(schedLine, 25) = False
+                wsschedule.Cells(schedLine, 26) = False
+                wsschedule.Cells(schedLine, 27) = False
+                wsschedule.Cells(schedLine, 28) = False
+                wsschedule.Cells(schedLine, 29) = False
+                wsschedule.Cells(schedLine, 30) = False
+                wsschedule.Cells(schedLine, 31) = False
+                wsschedule.Cells(schedLine, 32) = False
+                wsschedule.Cells(schedLine, 33) = False
+                wsschedule.Cells(schedLine, 34) = False
+                wsschedule.Cells(schedLine, 35) = False
+                wsschedule.Cells(schedLine, 36) = False
+                
+            End If
+            
+        ElseIf Not wsimport.Range("F6") = "none" And Not wsreport.Cells(reportLine, ptname_col) = "BLOCK SCHEDULE" And wsimport.Range("F29") = True Then
+            ' There IS a match, and it is not BLOCK SCHEDULE, and it is a future date; we update the existing appointment
+        
+            schedLine = schedSel + 1
+            needEOL = False
+            neededWS = "none"
+                        
+            ' Write in the appointment information. For a known appointment, we can skip ID, date, time.
+            ' All other items are subject to change. (A patient's name may change, but ID number will not, and
+            ' if we have identified this as a "known appointment" (on the Import tab) then there will never be
+            ' a need to change those factors; that is how we know it is known.
+            
+            wsschedule.Cells(schedLine, 2) = wsreport.Cells(reportLine, ptid_col) ' ID
+            wsschedule.Cells(schedLine, 3) = wsreport.Cells(reportLine, ptname_col) ' Name
+            wsschedule.Cells(schedLine, 5) = appLoc ' wsreport.Cells(reportLine, loc_col) ' Location
+            wsschedule.Cells(schedLine, 6) = wsreport.Cells(reportLine, prov_col) ' Provider
+            wsschedule.Cells(schedLine, 7) = wsreport.Cells(reportLine, vis_col) ' Visit type
+            wsschedule.Cells(schedLine, 8) = wsreport.Cells(reportLine, status_col) ' Status
+            wsschedule.Cells(schedLine, 10) = schedIns ' The reassigned insurance value
+            wsschedule.Cells(schedLine, 11) = wsreport.Cells(reportLine, primid_col) ' Ins ID
+            wsschedule.Cells(schedLine, 18) = schedIns2 ' The reassigned secondary ins value
+            wsschedule.Cells(schedLine, 19) = wsreport.Cells(reportLine, secid_col) ' Ins2 ID
+            
+            vergetcopay = wsschedule.Cells(schedLine, 13) ' How is the COPAY currently set?
+            verppcyc = wsschedule.Cells(schedLine, 12) ' How is the PPCYC currently set?
+            
+            ' We want to make sure new appointments adhere to any changes made to PPCYC and COPAY.
+            
+            getcopay = True
+            
+            If verppcyc = True Then ' If the visit is set as PPCYC, set the COPAY to false for all visits.
+            
+                getcopay = False
+                
+            ElseIf vergetcopay = False Then
+            
+                getcopay = False ' If copay was previously set to FALSE, then leave it that way as default.
+                
+            End If
+            
+            ' To continue checking PPCYC and COPAY, examine the insurance given.
+            
+            If schedIns = "Progyny" Or schedIns = " SELF-PAY" Or schedIns = "Gestational Carrier" Or schedIns = "Donor — Do not bill" Then
+            
+                ' These insurances will ALWAYS say COPAY = false, regardless how it was set previously. This will capture any
+                ' errors when Progyny was set to COPAY = true, for instance.
+                
+                getcopay = False
+                
+            End If
+            
+            wsschedule.Cells(schedLine, 13) = getcopay ' OK to collect co-pay?
+                
+            If visok = False Then ' If this appointment should not be on the schedule for some reason, flag it for deletion.
+                wsschedule.Cells(schedLine, 37) = "DELETE"
+            End If
+            
+        End If
+        
+'        Call Add_EOL   ' Probably not efficient, fix later
+        If needEOL = True And neededWS = "schedule" Then ' Testing replacement code that should be more efficient
+
+            wsschedule.Cells(schedLine + 1, 2) = "EOL"
+            SCHEDULE_EOL = SCHEDULE_EOL + 1
+             
+        End If
+
+    ' Advance to the next line of the report
+        
+    reportLine = reportLine + 1
+    reportVal = wsreport.Cells(reportLine, 4)
+    
+    Wend
+
+    ' Reactivate autocalculations and activate the Sorter
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Sheet9.Range("H1") = True
+    
+    'Sort the schedule by ID, Date and Time
+    
+    Dim rawdata As ListObject
+    Set rawdata = wsschedule.ListObjects("Schedule")
+    
+    Dim datecol As Range
+    Dim timecol As Range
+    Dim idcol As Range
+    Dim namecol As Range
+    
+    Set datecol = Range("Schedule[DOS]")
+    Set timecol = Range("Schedule[Time In]")
+    Set idcol = Range("Schedule[ID]")
+    Set namecol = Range("Schedule[Patient_Name]")
+    
+    With rawdata.Sort
+        .SortFields.Clear
+        .SortFields.Add Key:=idcol, SortOn:=xlSortOnValues, Order:=xlAscending
+        .SortFields.Add Key:=datecol, SortOn:=xlSortOnValues, Order:=xlAscending
+        .SortFields.Add Key:=timecol, SortOn:=xlSortOnValues, Order:=xlAscending
+        .Header = xlYes
+        .Apply
+    End With
+    
+    wsimport.Range("L3") = Time
+
+
+End Sub
